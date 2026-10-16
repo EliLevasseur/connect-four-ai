@@ -1,21 +1,13 @@
 #include <vector>
 #include <random>
 #include <iostream>
+#include <filesystem>
+#include <string>
 
 #include "connect_four.h"
+#include "nnet/nn/checkpoint.h"
 
-struct moveRecord {
-	int moveNumber;
-	Cell player;
-	Board boardBeforeMove;
-	int chosenCol;
-};
-
-struct gameRecord {
-	int gameId;
-	std::vector<moveRecord> moves;
-	Cell winnerAfterGame;
-};
+const std::string checkpointFolder = "build/connect4/";
 
 gameRecord gameSim(int gameId, std::mt19937& generator) {
 	gameRecord record;
@@ -52,12 +44,7 @@ gameRecord gameSim(int gameId, std::mt19937& generator) {
 		if (row == -1)
 			break;
 
-		record.moves.push_back({
-			moveNumber,
-			player,
-			boardBeforeMove,
-			chosenCol
-		});
+		record.moves.push_back({moveNumber, player, boardBeforeMove, chosenCol});
 
 		Cell winner = getWinner(simBoard, row, chosenCol);
 
@@ -81,8 +68,81 @@ gameRecord gameSim(int gameId, std::mt19937& generator) {
 }
 
 
-int main() {
-	const int numberOfGames = 100;
+int randomMove(const Board& board, std::mt19937& generator) {
+	std::vector<int> legalColumns;
+	for (int col = 0; col < 7; col++) {
+		if (!columnFull(board, col))
+			legalColumns.push_back(col);
+	}
+	std::uniform_int_distribution<int> distribution(0, static_cast<int>(legalColumns.size()) - 1);
+	return legalColumns[distribution(generator)];
+}
+
+// win if possible, block if the opponent could win next, otherwise random
+int ruleBasedMove(const Board& board, Cell player, std::mt19937& generator) {
+	for (const Cell who : {player, other(player)}) {
+		for (int col = 0; col < 7; col++) {
+			if (columnFull(board, col)) continue;
+			Board next = board;
+			const int row = dropPiece(next, col, who);
+			if (getWinner(next, row, col) == who) return col;
+		}
+	}
+	return randomMove(board, generator);
+}
+
+// the model plays itself, with some random moves so the games vary
+gameRecord selfPlayGame(nnet::Sequential& model, double randomMoveChance, std::mt19937& generator) {
+	gameRecord record{0, {}, Cell::Empty};
+	Board board;
+	for (auto& row : board) row.fill(Cell::Empty);
+	std::uniform_real_distribution<double> coin(0.0, 1.0);
+	Cell player = Cell::PlayerOne;
+	for (int moveNumber = 0; !boardFull(board); moveNumber++) {
+		const int col = coin(generator) < randomMoveChance ? randomMove(board, generator)
+		                                                   : chooseMove(model, board, player);
+		record.moves.push_back({moveNumber, player, board, col});
+		const int row = dropPiece(board, col, player);
+		if (getWinner(board, row, col) == player) {
+			record.winnerAfterGame = player;
+			break;
+		}
+		player = other(player);
+	}
+	return record;
+}
+
+// wins for `model` out of 400 games against `opponent`, or against the
+// rule-based player when opponent is null; sides alternate, 10% random moves
+int winsOutOf400(nnet::Sequential& model, nnet::Sequential* opponent) {
+	std::mt19937 generator(321);
+	std::uniform_real_distribution<double> coin(0.0, 1.0);
+	int wins = 0;
+	for (int game = 0; game < 400; game++) {
+		const Cell modelPiece = game % 2 == 0 ? Cell::PlayerOne : Cell::PlayerTwo;
+		Board board;
+		for (auto& row : board) row.fill(Cell::Empty);
+		Cell player = Cell::PlayerOne;
+		while (!boardFull(board)) {
+			int col;
+			if (coin(generator) < 0.1) col = randomMove(board, generator);
+			else if (player == modelPiece) col = chooseMove(model, board, player);
+			else if (opponent) col = chooseMove(*opponent, board, player);
+			else col = ruleBasedMove(board, player, generator);
+			const int row = dropPiece(board, col, player);
+			if (getWinner(board, row, col) == player) {
+				if (player == modelPiece) wins++;
+				break;
+			}
+			player = other(player);
+		}
+	}
+	return wins;
+}
+
+
+int main(int argc, char* argv[]) {
+	const int numberOfGames = 50;
 	const unsigned int seed = 42;
 	std::mt19937 generator(seed);
 	std::vector<gameRecord> games;
@@ -119,6 +179,50 @@ int main() {
 
 		std::cout << "\n";
 }
+
+	// generation 0 learns from the random games above
+	std::filesystem::create_directories(checkpointFolder);
+	const std::string bestFile = checkpointFolder + "best.ckpt";
+	auto best = buildValueNetwork(generator);
+	trainAI(*best, games, 5, 0.001);
+	nnet::saveParameters(*best, bestFile);
+	nnet::saveParameters(*best, checkpointFolder + "gen_0.ckpt");
+	std::cout << "\ngeneration 0: " << winsOutOf400(*best, nullptr) << "/400 against the rule-based player\n";
+
+	// each round: self-play, train a candidate on the last few rounds of games,
+	// and keep it only if it beats the current best
+	// connect4_simulations 0 trains on the random games only
+	const int rounds = argc > 1 ? std::stoi(argv[1]) : 12;
+	std::vector<std::vector<gameRecord>> recentGames;
+	int generation = 0;
+	for (int round = 1; round <= rounds; round++) {
+		std::vector<gameRecord> selfPlay;
+		for (int game = 0; game < 3000; game++)
+			selfPlay.push_back(selfPlayGame(*best, 0.2, generator));
+		recentGames.push_back(std::move(selfPlay));
+		if (recentGames.size() > 4)
+			recentGames.erase(recentGames.begin());
+
+		std::vector<gameRecord> trainingGames;
+		for (const auto& roundGames : recentGames)
+			trainingGames.insert(trainingGames.end(), roundGames.begin(), roundGames.end());
+
+		auto candidate = buildValueNetwork(generator);
+		nnet::loadParameters(*candidate, bestFile);
+		trainAI(*candidate, trainingGames, 2, 0.0005);
+
+		const int candidateWins = winsOutOf400(*candidate, best.get());
+		const bool accepted = candidateWins >= 220;
+		if (accepted) {
+			generation++;
+			nnet::saveParameters(*candidate, bestFile);
+			nnet::saveParameters(*candidate, checkpointFolder + "gen_" + std::to_string(generation) + ".ckpt");
+			nnet::loadParameters(*best, bestFile);
+		}
+		std::cout << "round " << round << ": candidate won " << candidateWins << "/400 against the best, "
+		          << (accepted ? "accepted" : "rejected") << " | generation " << generation << ": "
+		          << winsOutOf400(*best, nullptr) << "/400 against the rule-based player\n";
+	}
 
 	return 0;
 }
